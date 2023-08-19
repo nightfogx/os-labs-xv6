@@ -1,0 +1,309 @@
+# Lab7：Multithreading
+## 1.	Uthread: switching between threads (moderate)
+### 1）实验目的
+
+为用户级线程系统设计上下文切换机制，然后实现它。
+
+xv6 有两个文件 user/uthread.c 和 user/uthread_switch.S，以及 Makefile 中的一条规则，用于构建一个 uthread 程序。uthread.c包含大部分用户级线程包，以及三个简单测试线程的代码。线程包缺少一些用于创建线程和在线程之间切换的代码。
+
+
+### 2）	实验步骤
+1. 这里我们需要做的是在线程切换时完成寄存器的切换，寄存器记录了进程的一些重要的值，保存起来后才能借助这些被保留的寄存器来恢复进程，通用的寄存器有栈顶寄存器sp，记录程序处地址的ra寄存器…所以我们需要定义其结构体如下（与kernel/proc.h中内核的上下文一致）,将其定义在user/uthread.c中，非必要说明，一下内容均在该c文件中修改。
+```
+struct context {
+  uint64 ra;//程序入口
+  uint64 sp;//栈顶寄存器
+
+  // 被调用者保存的寄存器，s0-s11记录线程的一些指令和操作
+  uint64 s0;
+  uint64 s1;
+  uint64 s2;
+  uint64 s3;
+  uint64 s4;
+  uint64 s5;
+  uint64 s6;
+  uint64 s7;
+  uint64 s8;
+  uint64 s9;
+  uint64 s10;
+  uint64 s11;
+};
+
+```
+2. 在线程结构中加入属性上下文，有利于上下文跟线程的一一对应
+ ```
+struct thread {
+  char       stack[STACK_SIZE]; //线程的栈
+  int        state;             //有三种状态 FREE, RUNNING, RUNNABLE 
+
+  struct context    c;//上下文属性，记录线程的寄存器
+};
+
+
+```
+3. 当调用函数生成线程时，我们需要对应设置ra的值和sp的值，其中一个是进程的进入点，一个时栈顶值，所以我们需要将进入点函数的指针赋给t的ra寄存器，而sp应该是从t的栈初始值出发，再加上栈大小，因为栈是从下向上的，栈顶地址应更高，如下
+```
+thread_create(void (*func)())
+{
+  struct thread *t;
+
+  for (t = all_thread; t < all_thread + MAX_THREAD; t++) {
+    if (t->state == FREE) break;
+  }
+  t->state = RUNNABLE;//修改线程状态
+  
+  t->c.ra = (uint64)func;//分配函数进入点
+  t->c.sp = (uint64)t->stack + STACK_SIZE;//指向栈顶
+}
+
+```
+4. 其中fun是线程需要运作的内存，以一个线程b为例
+```
+thread_b(void)
+{
+  int i;
+  printf("thread_b started\n");
+  b_started = 1;//b开始
+  while(a_started == 0 || c_started == 0)
+    thread_yield();
+  
+  for (i = 0; i < 100; i++) {
+    printf("thread_b %d\n", i);
+    b_n += 1;
+    thread_yield();//线程暂停，从正在运行变为可运行，进行线程的调度
+  }
+  printf("thread_b: exit after %d\n", b_n);
+
+  current_thread->state = FREE;//线程结束
+  thread_schedule();//调用schedule进行调度，线程切换
+}
+
+```
+5. 然后注意最后调用thread_schedule这时意味着当前线程已经状态空闲，其他线程可以开始工作，查找新的线程进行线程切换，其定义如下，线程调度时会一直循环知道找到可运行的线程，同时thread_yield也会将线程从运行调为可运行进行调度。
+```
+void 
+thread_schedule(void)
+{
+  struct thread *t, *next_thread;
+
+  //擦找可运行的线程
+  next_thread = 0;
+  t = current_thread + 1;//运行下一个线程
+  for(int i = 0; i < MAX_THREAD; i++){
+    if(t >= all_thread + MAX_THREAD)//遍历完没找到可运行的线程
+      t = all_thread;//从头再找
+    if(t->state == RUNNABLE) {//找到可运行的线程
+      next_thread = t;
+      break;
+    }
+    t = t + 1;
+  }
+
+  if (next_thread == 0) {//如果一直找不到
+    printf("thread_schedule: no runnable threads\n");
+    exit(-1);
+  }
+	
+  if (current_thread != next_thread) {         //进行线程的切换
+    next_thread->state = RUNNING; //线程状态从可运行变为运行中
+    t = current_thread; //因为后面仍需要这个进行的寄存器信息，所以需要中间变量t
+    current_thread = next_thread;//更新当前进程
+    
+    thread_switch((uint64)(&t->c),(uint64)(&next_thread->c));//调用进行调度函数进行上下文的切换
+  } else
+    next_thread = 0;
+}
+
+void 
+thread_yield(void)
+{
+  current_thread->state = RUNNABLE;//调为可运行
+  thread_schedule();//调度
+}
+
+```
+
+6. thread_switch完成了上下文的切换，它是用汇编语言写的，这样运行的更快，进程切换的时间损耗就没那么大，其定义在user/thread_switch.S中
+```
+
+.text
+
+/*
+     保存旧寄存器，加载新的上下文
+     */
+
+.globl thread_switch
+thread_switch:
+    //保存旧的上下文（寄存器）信息
+	sd ra, 0(a0)
+	sd sp, 8(a0)
+	sd s0, 16(a0)
+	sd s1, 24(a0)
+	sd s2, 32(a0)
+	sd s3, 40(a0)
+	sd s4, 48(a0)
+	sd s5, 56(a0)
+	sd s6, 64(a0)
+	sd s7, 72(a0)
+	sd s8, 80(a0)
+	sd s9, 88(a0)
+	sd s10, 96(a0)
+	sd s11, 104(a0)
+	//将新的上下文信息加载到寄存器中
+	ld ra, 0(a1)
+	ld sp, 8(a1)
+	ld s0, 16(a1)
+	ld s1, 24(a1)
+	ld s2, 32(a1)
+	ld s3, 40(a1)
+	ld s4, 48(a1)
+	ld s5, 56(a1)
+	ld s6, 64(a1)
+	ld s7, 72(a1)
+	ld s8, 80(a1)
+	ld s9, 88(a1)
+	ld s10, 96(a1)
+	ld s11, 104(a1)
+	
+	ret    /*进从ra处入新的线程*/
+
+```
+
+7. 实验结果
+![Alt text](image-30.png)
+
+### 3）	实验中遇到的问题和解决方法
+1. 如何管理线程的上下文？
+   
+   解决方案：在切换线程时，你需要保存当前线程的上下文，包括寄存器、栈指针等信息。然后，恢复下一个线程的上下文，使其可以继续执行。
+
+2. 如何设计线程的创建和切换机制？
+   
+   在 uthread.c 文件中，需要完成 thread_create()、thread_schedule() 和 thread_switch 函数的实现。确保在第一次运行线程时，线程能够执行通过 thread_create() 传递的函数，同时在线程切换时保存和恢复寄存器的状态。
+
+### 4）实验心得
+&emsp;&emsp;这个实验涉及到实现用户级线程的切换机制。通过实现线程切换，更深入地理解线程上下文的保存和恢复，以及如何在多线程环境中实现并发执行。
+
+&emsp;&emsp;了解了一些gdb的使用，比如用 “x”，可以检查一个内存位置的内容。  
+```
+ (gdb) x/x next_thread->stack
+ ```
+
+## 2.	Using threads (moderate)
+### 1）实验目的
+ 使用哈希表探索使用线程和锁进行并行编程
+
+### 2）	实验步骤
+1. 首先声明一个锁
+```
+  
+  11 pthread_mutex_t lock;            // declare a lock
+  12 
+  13 struct entry {
+  14   int key;
+  15   int value;
+  16   struct entry *next;
+  17 };
+
+
+```
+
+2. 在主函数调用初始化锁函数
+```
+103 int
+104 main(int argc, char *argv[])
+105 {
+ ...
+110   if(pthread_mutex_init(&lock,NULL)!=0) // initialize the lock
+111     {
+112         printf("Init lock error!");
+113         exit(-1);
+114     }
+
+
+```
+3. 最后在需要的地方进行加锁与开锁操作
+```
+40 static 
+ 41 void put(int key, int value)
+ 42 {
+ 43   int i = key % NBUCKET;
+ 44 
+ 45   // is the key already present?
+ 46   struct entry *e = 0;
+ 47   for (e = table[i]; e != 0; e = e->next) {
+ 48     if (e->key == key)
+ 49       break;
+ 50   }
+ 51   if(e){
+ 52     // update the existing key.
+ 53     e->value = value;
+ 54   } else {
+ 55     // the new is new.
+ 56     pthread_mutex_lock(&lock);       // acquire lock
+ 57     insert(key, value, &table[i], table[i]);
+ 58     pthread_mutex_unlock(&lock);       // acquire lock
+ 59   }
+ 60 }
+
+
+```
+
+
+### 3）	实验中遇到的问题和解决方法
+1. 并发访问导致死锁。
+   
+   解决方案：如果多个线程同时请求多个锁，并且互相等待对方释放锁，就可能导致死锁。避免死锁的一种方法是按照固定的顺序获取锁，从而避免循环等待。
+
+2. 什么是哈希表
+
+  
+    哈希表（Hash Table），也被称为散列表，是一种常用的数据结构，用于实现关联数组（Associative Array）或映射（Map）这样的数据结构。它通过将键（Key）映射到值（Value）来实现快速的数据访问，具有高效的插入、删除和查找操作。
+
+    哈希表的核心思想是通过哈希函数将键映射到一个固定大小的数组中的索引，从而实现对值的快速访问。哈希函数将键转换为索引的过程是快速的，使得在平均情况下，哈希表的插入、删除和查找操作都具有常数时间的复杂度（O(1)）。
+   
+
+### 4）实验心得
+&emsp;&emsp;理解并发问题：实验中的哈希表在单线程环境下运行正常，但在多线程环境下会出现缺失的关键问题。
+
+&emsp;&emsp;通过添加锁来保护并发访问共享资源，我认识到锁在并发编程中的重要性。锁可以防止多个线程同时访问临界区，从而避免竞争条件。
+
+## 3.	Barrier(moderate)
+### 1）实验目的
+  在这个作业中，实现一个障碍：在一个应用程序中的一个点，所有参与的线程必须等待，直到所有其他参与的线程也到达这个点。
+
+### 2）	实验步骤
+1. 实现一个barrier（）函数，使得能够等待所有线程到达barrier函数，然后再进行下一轮的迭代，这里需要注意，一个线程需要另外一个线程进行唤醒（最后一个线程需要唤醒前面所有线程），然后使用最后一个线程的round。
+  
+```
+25 static void 
+ 26 barrier()
+ 27 {
+ 28     pthread_mutex_lock(&bstate.barrier_mutex);
+ 29     bstate.nthread++;
+ 30     int m = bstate.nthread;
+ 31     if(m<nthread){
+ 32         pthread_cond_wait(&bstate.barrier_cond, &bstate.barrier_mutex);
+ 33     }else{
+ 34         bstate.round++;
+ 35         bstate.nthread = 0;
+ 36         pthread_cond_broadcast(&bstate.barrier_cond);
+ 37     }                                                                                                                                               
+ 38     pthread_mutex_unlock(&bstate.barrier_mutex);
+ 39 }
+
+```
+
+2. 运行结果
+### 3）	实验中遇到的问题和解决方法
+1. 避免直接在传递的参数中传递发生改变的量，否则会导致结果不可测。
+   
+   解决方案：重新申请一块内存，存入需要传递的参数，再将这个地址作为arg传入。
+
+2. 如何实现定时器功能，使得某个进程在一定时间后收到一个中断？
+   需要在 xv6 中实现一个定时器机制，以便在一定时间后产生一个中断。可以通过设置时钟中断处理程序，根据预定的时间间隔来触发中断。在中断处理程序中，你可以选择更新进程的剩余时间，或者直接触发进程切换。
+   
+### 4）实验心得
+&emsp;&emsp;alarm 实验涉及到定时器中断和进程切换，让我能够体验多任务处理的概念。学会如何在不同进程之间切换，确保每个进程都能够在规定的时间内得到执行。
+
+&emsp;&emsp;alarm 实验涉及到定时器中断和进程切换，让我能够体验多任务处理的概念。我会学会如何在不同进程之间切换，确保每个进程都能够在规定的时间内得到执行。
