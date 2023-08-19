@@ -1,0 +1,299 @@
+# Lab4：traps
+## 1.	RISC-V assembly (easy)
+### 1）实验目的
+
+Xv6操作系统的系统调用通过trampoline来实现用户空间和内核空间之间的跳转，trampoline页面是在内核地址空间和用户地址空间均有相同的地址映射，也就是说：trampoline页面在物理地址空间只有一份(且是可读可执行的代码)，而在内核地址空间和用户地址空间中，均将MAXVA - PGSIZE的地址(也就是第一个页面)映射到了这段代码。
+读取调用中的代码。Asm中的函数g, f和main。RISC-V的使用说明书在参考页。
+
+
+### 2）	实验步骤
+ 为了理解Xv6的代码，需要了解部分risc-v的汇编，如果不深究的话，我认为只需要知道函数调用参数传递通过的是a0-a7寄存器，函数调用返回值通过a0寄存器返回。其他很多指令和x86汇编类似。
+![Alt text](image-24.png)
+
+
+
+### 3）实验心得
+Q: 哪些寄存器包含函数的参数?例如，哪个寄存器在main对printf的调用中保存了传参13 ?
+
+A: a2保存13(通过gdb调试可看出寄存器a2的值)
+
+Q:在main的程序集代码中，函数f的调用在哪里?调用g在哪里?(提示:编译器可能内联函数。)
+
+A:查看asm文件，发现没有对f,g的调用，g被内联f函数，f函数被内联到main函数
+
+Q：printf函数的地址在哪里？
+
+A：34:   600080e7            jalr    1536(ra)
+
+    # 630 <printf>可知0x630是printf函数入口
+
+Q：main中，jalr跳转到printf之后，ra的值是多少？
+
+A:ra的值是0x38, 对应的0x34的下一条指令
+
+  当printf执行完成后，会让pc=寄存器ra的值，然后程序会执行main函数中的0x38这行的代码
+Q: xv6是小端的，如果要实现一样的输出：HE110 World，大端模式下该如何实现？
+
+小端：低地址在前
+
+    0x00000064用字符串打出来，发现解释的方向是64 00 00 00 即r\0\0\0 而不是 \0\0\0r这就是小端
+
+1. 所以如果大端需要输出r ，int c = 0x64000000; 即可输出r.
+
+2. 而对于int的数据，则无论大小端用%d输出的值都一样
+
+Q: printf("x=%d y=%d", 3); 输出结果是什么？
+
+A: y输出的是寄存器a2的值
+
+## 2.	Backtrace (moderate)
+### 1）实验目的
+ 这道题要求打印出当前函数调用栈的情况
+
+### 2）	实验步骤
+1. 我们知道函数的调用栈是向低地址增长，在每一个函数调用的栈帧中，首先是函数调用的返回地址，然后是一个指向上一个栈帧的指针fp，然后是一些需要被保护的寄存器(callee saved register)。因此这里为了将函数调用栈所有的返回地址Return Address打印出来，只需要遍历当前的栈就行了。
+2. 首先需要在kernel/riscv.h中加入获取当前栈指针fp的函数：
+```
+// get current frame pointer from s0 register
+static inline uint64
+r_fp()
+{
+  uint64 x;
+  asm volatile("mv %0, s0" : "=r" (x));
+  return x;
+}
+```
+3. 然后在kernel/defs.h中添加backtrace函数声明：
+
+4. 最重要的是在kernel/printf.c中添加函数实现，系统级编程中存在大量的强制类型转换，需要头脑清醒的知道自己在干什么！这里是遍历当前的栈，通过fp指针在栈帧之间跳转，并打印出栈帧中的函数返回地址。
+```
+// print current function stack
+void backtrace(void)
+{
+  printf("backtrace:\n");
+  uint64 fp = r_fp();
+  while (fp < PGROUNDUP(fp)) {
+    printf("%p\n", *(uint64*)(fp-8));  // got return address
+    fp = *(uint64*)(fp - 16);
+  }
+}
+```
+5. 最后不要忘了在kernel/sysproc.c中的sys_sleep函数中调用backtrace函数：
+```
+ uint64
+sys_sleep(void)
+{
+  int n;
+  uint ticks0;
+
+  if(argint(0, &n) < 0)
+    return -1;
+  acquire(&tickslock);
+  ticks0 = ticks;
+  while(ticks - ticks0 < n){
+    if(myproc()->killed){
+      release(&tickslock);
+      return -1;
+    }
+    sleep(&ticks, &tickslock);
+  }
+  release(&tickslock);
+  backtrace();
+  return 0;
+}
+
+```
+
+6.  运行结果：
+
+![Alt text](image-25.png)
+
+
+### 3）	实验中遇到的问题和解决方法
+1. 如何获取栈帧的返回地址和参数？
+   
+   解决方案：栈帧中包含了函数的返回地址和参数等信息。你可以通过栈指针（SP）加上偏移量来获取这些信息。一般来说，返回地址在当前函数栈帧的前一个位置，参数通常在更早的位置。你可以查阅操作系统的文档或资料以获取更详细的信息。
+
+2. 如何测试 backtrace 函数的正确性？
+   解决方法: 编写一些简单的测试程序，在其中进行多层函数调用，然后调用你实现的 backtrace 函数，检查输出是否符合预期的调用栈信息。还可以尝试在不同的情况下测试，例如异常情况（如栈溢出）、递归调用等。
+
+### 4）实验心得
+&emsp;&emsp;通过该实验在，我对栈的概念以及栈帧的结构有清晰的理解。理解函数调用时如何在栈上保存返回地址和局部变量等信息，对于实现 backtrace 函数至关重要。
+
+&emsp;&emsp;学会编写测试用例：编写一些简单的测试用例来验证你实现的 backtrace 函数是否正确。这些测试用例可以涵盖不同的调用栈层次、函数参数等情况。
+
+## 3.	Alarm (hard)
+### 1）实验目的
+  向 xv6 添加一项功能，该功能会在进程使用 CPU 时间时定期向其发出警报。 这对于想要限制它们占用多少 CPU 时间的受计算限制的进程，或者对于想要计算但也想采取一些定期操作的进程来说可能很有用。 
+
+### 2）	实验步骤
+1. 首先添加系统调用，在user/usys.pl中加入：
+  
+```
+entry("sigalarm");
+entry("sigreturn");
+```
+2. 在user/user.h中加入函数声明：
+```
+// add two new syscall for Lab:Alarm
+int sigalarm(int ticks, void (*handler)());
+int sigreturn(void);
+```
+   
+3. 在kernel/syscall.h中加入系统调用号：
+   
+```
+#define SYS_sigalarm 22
+#define SYS_sigreturn 23
+```
+4. 在kernel/syscall.c中加入以下代码：
+```
+extern uint64 sys_sigalarm(void);
+extern uint64 sys_sigreturn(void);
+
+[SYS_sigalarm] sys_sigalarm,
+[SYS_sigreturn] sys_sigreturn,
+```   
+   
+   
+5. 为了实现上面的功能，需要在进程结构中存储相关的状态，在kernel/proc.h中加入以下5个变量：
+   
+```
+// Per-process state
+struct proc {
+  struct spinlock lock;
+
+  // p->lock must be held when using these:
+  enum procstate state;        // Process state
+  void *chan;                  // If non-zero, sleeping on chan
+  int killed;                  // If non-zero, have been killed
+  int xstate;                  // Exit status to be returned to parent's wait
+  int pid;                     // Process ID
+
+  // wait_lock must be held when using this:
+  struct proc *parent;         // Parent process
+
+  // these are private to the process, so p->lock need not be held.
+  uint64 kstack;               // Virtual address of kernel stack
+  uint64 sz;                   // Size of process memory (bytes)
+  pagetable_t pagetable;       // User page table
+  struct trapframe *trapframe; // data page for trampoline.S
+  struct context context;      // swtch() here to run process
+  struct file *ofile[NOFILE];  // Open files
+  struct inode *cwd;           // Current directory
+  char name[16];               // Process name (debugging)
+  /*** for lab ***/
+  int alarm_interval;       // every alarm_interval call alarm handler
+  void (*alarm_handler)();     // alarm handler
+  int ticks;                   // timer ticks
+  struct trapframe *saved_trapframe; // save trapframe when exec alarm handler
+  int alarm_handling;          // if non-zero, alarm handler is being exec
+};
+```
+alarm_interval和alarm_handler存储用户sigalarm调用的参数，ticks记录当前进程使用的时间片总数；saved_trapframe用于在执行alarm_handler函数之前，保存当前的寄存器，便于后面断点恢复。最后一个变量alarm_handling用于标志当前是否正在执行alarm_handler，以防止函数重入。
+
+6. 不要忘了在进程初始化时对这些变量初始化，在kernel/proc.c中的allocproc函数中加入：
+```
+// initialize alarm varibles
+p->alarm_handler = 0;
+p->alarm_interval = 0;
+p->ticks = 0;
+p->alarm_handling = 0;
+if ((p->saved_trapframe = (struct trapframe *)kalloc()) == 0) {
+  freeproc(p);
+  release(&p->lock);
+  return 0;
+}
+```
+
+7. 在kernel/proc.c的preeproc函数中加入以下代码以销毁saved_trapframe：
+
+```
+if (p->saved_trapframe)
+  kfree((void*)p->saved_trapframe);
+```
+8. 最后修改kernel/trap.c中的usertrap函数：
+   
+```
+//
+// handle an interrupt, exception, or system call from user space.
+// called from trampoline.S
+//
+void
+usertrap(void)
+{
+  int which_dev = 0;
+
+  if((r_sstatus() & SSTATUS_SPP) != 0)
+    panic("usertrap: not from user mode");
+
+  // send interrupts and exceptions to kerneltrap(),
+  // since we're now in the kernel.
+  w_stvec((uint64)kernelvec);
+
+  struct proc *p = myproc();
+  
+  // save user program counter.
+  p->trapframe->epc = r_sepc();
+  
+  if(r_scause() == 8){
+    // system call
+
+    if(p->killed)
+      exit(-1);
+
+    // sepc points to the ecall instruction,
+    // but we want to return to the next instruction.
+    p->trapframe->epc += 4;
+
+    // an interrupt will change sstatus &c registers,
+    // so don't enable until done with those registers.
+    intr_on();
+
+    syscall();
+  } else if((which_dev = devintr()) != 0){
+    // ok
+    if (which_dev == 2) {
+      // timer interrupt
+      p->ticks ++;
+      if (p->alarm_interval != 0 && p->ticks % p->alarm_interval == 0) {
+        if (p->alarm_handling == 0) {
+          p->alarm_handling = 1;
+          // save origin trapframe
+          cpytrapframe(p->saved_trapframe, p->trapframe);
+          // if arrival time interval, set return address to alarm_handler
+          p->trapframe->epc = (uint64)p->alarm_handler;
+        }
+      }
+    }
+  } else {
+    printf("usertrap(): unexpected scause %p pid=%d\n", r_scause(), p->pid);
+    printf("            sepc=%p stval=%p\n", r_sepc(), r_stval());
+    p->killed = 1;
+  }
+
+  if(p->killed)
+    exit(-1);
+
+  // give up the CPU if this is a timer interrupt.
+  if(which_dev == 2)
+    yield();
+
+  usertrapret();
+}
+```
+
+
+
+### 3）	实验中遇到的问题和解决方法
+1. 如何跟踪每个进程的剩余时间和定时器？
+   
+   解决方案：需要在进程控制块中添加一个字段来记录进程的剩余时间。在每次时钟中断发生时，相应地减少每个进程的剩余时间。当某个进程的剩余时间达到零时，触发相应的行为，如中断该进程。
+
+2. 如何实现定时器功能，使得某个进程在一定时间后收到一个中断？
+   需要在 xv6 中实现一个定时器机制，以便在一定时间后产生一个中断。可以通过设置时钟中断处理程序，根据预定的时间间隔来触发中断。在中断处理程序中，你可以选择更新进程的剩余时间，或者直接触发进程切换。
+   
+### 4）实验心得
+&emsp;&emsp;alarm 实验涉及到定时器中断和进程切换，让我能够体验多任务处理的概念。学会如何在不同进程之间切换，确保每个进程都能够在规定的时间内得到执行。
+
+&emsp;&emsp;alarm 实验涉及到定时器中断和进程切换，让我能够体验多任务处理的概念。我会学会如何在不同进程之间切换，确保每个进程都能够在规定的时间内得到执行。
