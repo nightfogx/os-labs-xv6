@@ -1,0 +1,223 @@
+# Lab2：page tables
+## 1.	Print a page table (easy)
+### 1）实验目的
+  为了帮助学习RISC-V page tables，也可能是帮助未来的调试，第一个任务是写一个函数来打印页表内容。
+定义一个函数vmprint()。它应该接收一个pagetable_t参数，并且用下面格式打印页表。
+在exec.c中return argc之前，插入if(p->pid==1) vmprint(p-pagetable)，来打印第一个进程的页表。
+当启动xv6时，应该打印以下内容，描述第一个进程的页表信息，在刚执行完exec()时。
+
+![Alt text](image-12.png)
+
+第一行显示了vmprint()的参数。在那之后每行对应一个PTE，包含树中指向page-table pages的PTE。
+每个PTE行由一些".."（表明树的深度）缩进。
+每个PTE行显示PTE在page-table page中的索引、pte地址、pte中的物理页地址。不要打印无效PTE。
+在上面的例子中，有顶级page-table page：0、255。entry 0的下一级仅有索引0， 这个索引0的下一级有0、1、2三个PTE。
+你的代码可能生成与上面那些代码不同的物理地址。entry和虚拟地址的数量应该一样。
+
+
+### 2）	实验步骤
+1. 在vm.c中， 实现一个vmprint()函数来遍历页表并打印，由于 xv6 中采用三级页表，所以需要递归的遍历每级页目录。实现的思路与 `void freewalk(pagetable_t pagetable)` 类似，我们可以遍历 512 个页表项，按所在级数判断是否递归，具体如下：
+```
+void printwalk(pagetable_t pagetable, int level) {
+  char* prefix;
+  if (level == 2) prefix = "..";
+  else if (level == 1) prefix = ".. ..";
+  else prefix = ".. .. ..";
+
+  for(int i = 0; i < 512; i++){
+    pte_t pte = pagetable[i];
+    if(pte & PTE_V){
+      uint64 pa = PTE2PA(pte);
+      printf("%s%d: pte %p pa %p\n", prefix, i, pte, pa);
+      if((pte & (PTE_R|PTE_W|PTE_X)) == 0){
+        printwalk((pagetable_t)pa, level - 1);
+      }
+    }
+  }
+}
+
+int
+vmprint(pagetable_t pagetable) {
+  printf("page table %p\n", pagetable);
+  printwalk(pagetable, 2); 
+  return 0;
+}
+
+```
+
+   
+2. 运行结果：
+
+![Alt text](image-13.png)
+
+
+### 3）	实验中遇到的问题和解决方法
+1. 函数写完之后第一次make qemu时报错
+   
+   解决方案：忘记加函数声明，应该再def.h文件中加入vmprint（）函数的申明。
+
+2. 页面地址和物理地址之间如何转换？
+   解决方法: 在xv6中，页面地址和物理地址可以通过位操作来进行转换。页表项中存储了物理页面的基地址，通过将页面地址与物理页面基地址进行位运算，可以得到物理地址。
+
+### 4）实验心得
+&emsp;&emsp;理解页表结构：这个实验让我深入理解了页表的结构和作用。通过查看和输出页表项的内容，我对虚拟地址如何映射到物理地址有了更清晰的认识。
+
+&emsp;&emsp;视角的转变：完成这个实验后，我对操作系统的运行和内存管理有了更深入的理解。我能够从底层的角度去思考和分析问题，并且对于操作系统的工作原理有了更全面和系统的认识。
+
+
+## 2.	A kernel page table per process (hard)
+### 1）实验目的
+  无论何时在内核执行时，xv6使用同一个内核页表。内核页表是一个物理地址的直接映射，因此内核虚拟地址x对应物理地址x。
+xv6也有一个单独的页表给每个进程的用户地址空间，仅包含那个进程用户内存的映射，起始于虚拟地址0。
+因为内核页表不包含这些映射，用户地址在内核无效。因此，当内核需要使用一个用户指针传到system call时，内核必须首先翻译指针到物理地址。
+
+### 2）	实验步骤
+1. 在proc结构体中添加一个kernel pgtable
+2. 初始化内核态页表，根据提示我们要仿照kvminit函数，实现如下函数，需要在 kernel/defs.h 添加函数声明
+```
+pagetable_t     kkvminit(void);
+```
+3. 参考kvminit函数中为kernel_pagetable添加映射的kvmmap函数，重新实现一个映射函数kkvmmap
+```
+void 
+kkvmmap(pagetable_t kpagetable,uint64 va,uint64 pa,uint64 sz,int perm){
+  if(mappages(kpagetable,va,sz,pa,perm)!=0){
+    panic("kkvmmap");
+  }
+}
+```
+4. 仿照kvminit函数的方式初始化
+```
+pagetable_t
+kkvminit(){
+  pagetable_t kpagetable = (pagetable_t) kalloc();
+  memset(kpagetable,0,PGSIZE);
+  kkvmmap(kpagetable,UART0, UART0, PGSIZE, PTE_R | PTE_W);
+  kkvmmap(kpagetable,VIRTIO0, VIRTIO0, PGSIZE, PTE_R | PTE_W);
+  kkvmmap(kpagetable,CLINT, CLINT, 0x10000, PTE_R | PTE_W);
+  kkvmmap(kpagetable,PLIC, PLIC, 0x400000, PTE_R | PTE_W);
+  kkvmmap(kpagetable,KERNBASE, KERNBASE, (uint64)etext-KERNBASE, PTE_R | PTE_X);
+  kkvmmap(kpagetable,(uint64)etext, (uint64)etext, PHYSTOP-(uint64)etext, PTE_R | PTE_W);
+  kkvmmap(kpagetable,TRAMPOLINE, (uint64)trampoline, PGSIZE, PTE_R | PTE_X);
+  return kpagetable;
+}
+
+```
+5. 在kernel/proc.c 中的 allocproc 函数里添加调用函数的代码：
+  ```
+  // An empty kernel page table
+  p->kpagetable=kkvminit();
+  if(p->kpagetable==0){
+    freeproc(p);
+    release(&p->lock);
+    return 0;
+  }
+
+  ```
+6. 初始化内核栈，根据提示原本所有的内核栈都在procinit中设置
+```
+   void
+procinit(void)
+{
+  struct proc *p;
+  initlock(&pid_lock, "nextpid");
+  for(p = proc; p < &proc[NPROC]; p++) {
+      initlock(&p->lock, "proc");
+      // Allocate a page for the process's kernel stack.
+      // Map it high in memory, followed by an invalid
+      // guard page.
+      char *pa = kalloc();
+      if(pa == 0)
+        panic("kalloc");
+      uint64 va = KSTACK((int) (p - proc));
+      kvmmap(va, (uint64)pa, PGSIZE, PTE_R | PTE_W);
+      p->kstack = va;
+  }
+  kvminithart();
+}
+
+```
+7. 进程调度时，切换内核页。将当前进程的kernel page存入stap寄存器中
+```
+w_satp(MAKE_SATP(p->kpagetable));
+sfence_vma();
+
+```
+8. 释放内核页表
+```
+if(p->kstack){
+  pte_t* pte=walk(p->kpagetable,p->kstack,0);
+  if(pte==0){
+    panic("freeproc: walk");
+  }
+  kfree((void*)PTE2PA(*pte));
+}
+p->kstack=0;
+```
+9. 切换进程内核页表，更改kvmpa函数
+```
+pte = walk(myproc()->kpagetable, va, 0);
+```
+10. 运行结果：
+
+![Alt text](image-14.png)
+
+
+### 3）	实验中遇到的问题和解决方法
+1. 释放空间时，直接调用freewalk不行
+   
+   解决方案：由于 freewalk 函数将对应的物理地址也直接释放了，我们这里释放的内核页表仅仅只是用户进程的一个备份，释放时仅释放页表的映射关系即可，不能将真实的物理地址也释放了。因此不能直接调用freewalk 函数，而是需要进行更改，自己实现一个proc_freewalk函数：
+
+2. 页面地址和物理地址之间如何转换？
+   解决方法: 在xv6中，页面地址和物理地址可以通过位操作来进行转换。页表项中存储了物理页面的基地址，通过将页面地址与物理页面基地址进行位运算，可以得到物理地址。
+
+### 4）实验心得
+&emsp;&emsp;多进程内核空间隔离：实验的目标是确保每个进程拥有独立的内核页表，以实现内核空间的隔离。这要求对进程切换、内核页表的同步和共享等问题进行仔细处理，避免不同进程之间的冲突和竞争条件。
+
+&emsp;&emsp;对操作系统的深入了解：完成这个实验后，我对操作系统的内部机制有了更深入的了解。我理解了进程的内核空间隔离的重要性，以及如何通过内核页表来实现进程之间的隔离和保护。
+
+## 3.	Simplify copyin/copyinstr (hard)
+### 1）实验目的
+  内核的copyin函数读取用户指针指向的内存。它先将它们翻译为物理地址（内核可以直接用）。通过代码walk进程页表实现翻译。
+在此实验中，你的工作是给每个进程的内核页表添加用户映射，使得copyin可以直接使用用户指针。
+
+
+### 2）	实验步骤
+1. 在kernel/proc.c中，修改userinit方法
+  
+    ![Alt text](image-15.png)
+2. 在kernel/proc.c中，修改fork方法
+  
+    ![Alt text](image-16.png)
+3. 在kernel/exec.c中，修改exec()，在用户进程页表重新生成完后，取消进程内核页表之前的映射，在进程内核页表，建立新进程页表的映射
+   
+    ![Alt text](image-17.png)
+4. 在sysproc.c中，修改sys_sbrk()，在内存扩张、缩小时，相应更改进程内核页表
+   
+    ![Alt text](image-18.png)
+5. 在kernel/proc.c中，修改freeproc和proc_free_kernel_pagetable方法，取消进程内核页表地址映射
+   
+    ![Alt text](image-19.png)
+6. 在kernel/defs.h中，添加copyin_new()、copyinstr_new()的声明
+
+    ![Alt text](image-20.png)
+7. 在kernel/vm.c中，替换copyin()、copyinstr()为copyin_new()、copyinstr_new()
+
+    ![Alt text](image-21.png)
+8. 测试结果：
+   
+   ![Alt text](image-22.png)
+
+
+
+### 3）	实验中遇到的问题和解决方法
+1. make grade时错误
+
+![Alt text](image-23.png)
+   
+   解决方案：添加answers-pgtbl.txt
+
+### 4）实验心得
+&emsp;&emsp;调试和验证的挑战：由于实验涉及到对核心操作系统代码的修改和调试，调试和验证的过程可能比较复杂。我学会了使用调试工具和编写测试用例来验证实现的正确性，这对于调试和验证实验结果非常有帮助。
+
+&emsp;&emsp;如何管理和切换进程的内核页表:为每个进程创建独立的内核页表后，你需要修改进程切换的代码，确保在切换进程时正确加载和更新进程的内核页表。这涉及到在进程切换时保存和恢复内核页表的状态。
